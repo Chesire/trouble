@@ -579,6 +579,16 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
                 }
                 #[cfg(feature = "security")]
                 {
+                    // The host resolved the peer's address itself: a bond's IRK matched an address the
+                    // controller did not resolve, so the peer connected from a resolvable private
+                    // address. Keep that on-air address as the controller would have reported it.
+                    // Pairing must use the address the peer connected from (Core Vol 3 Part H
+                    // §2.2.7), not the bonded identity address, or a peer that lost its bond and
+                    // pairs again fails the DHKey check.
+                    let mut resolvable_addrs = resolvable_addrs;
+                    if resolvable_addrs.peer.is_none() && identity.addr != peer_addr {
+                        resolvable_addrs.peer = Some(peer_addr.addr);
+                    }
                     storage.resolvable_addrs = resolvable_addrs;
                 }
 
@@ -1630,6 +1640,61 @@ pub(crate) mod tests {
         // The next offset would be 0x10000: it does not match, and it must not overflow.
         assert!(state.queue(1, u16::MAX, &[2]).is_err());
         assert!(state.queue(1, 0, &[2]).is_err());
+    }
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn host_resolved_rpa_is_kept_for_pairing() {
+        use crate::security_manager::{BondInformation, IdentityResolvingKey, LongTermKey};
+
+        let mgr = setup();
+        // The IRK and resolvable private address from `crypto::tests::rpa_test`.
+        let irk = unwrap!(IdentityResolvingKey::new(0x8b3958c158ed64467bd27bc90d3cf54d));
+        let rpa = BdAddr::new([0x92, 0xF2, 0x8F, 0x84, 0x72, 0x4F]);
+        let identity = Identity {
+            addr: Address::new(AddrKind::PUBLIC, BdAddr::new(ADDR_2)),
+            irk: Some(irk),
+        };
+        unwrap!(mgr.security_manager.add_bond_information(BondInformation {
+            ltk: LongTermKey::new(1),
+            identity,
+            is_bonded: true,
+            security_level: SecurityLevel::Encrypted,
+            #[cfg(feature = "legacy-pairing")]
+            ediv: 0,
+            #[cfg(feature = "legacy-pairing")]
+            rand: [0; 8],
+            #[cfg(feature = "legacy-pairing")]
+            encryption_key_len: 16,
+        }));
+
+        // The controller reports the RPA as the peer address, and no resolved RPA.
+        unwrap!(mgr.connect(
+            ConnHandle::new(3),
+            Address::new(AddrKind::RANDOM, rpa),
+            LeConnRole::Peripheral,
+            ConnParams::new(),
+        ));
+
+        let connections = mgr.connections.borrow();
+        let storage = unwrap!(connections.iter().find(|c| c.handle == ConnHandle::new(3)));
+        assert_eq!(storage.peer_identity.addr, identity.addr, "the bond's identity is the peer");
+        assert_eq!(storage.resolvable_addrs.peer, Some(rpa), "the on-air RPA is kept for pairing");
+    }
+
+    #[cfg(feature = "security")]
+    #[test]
+    fn identity_address_connection_keeps_no_rpa() {
+        let mgr = setup();
+        unwrap!(mgr.connect(
+            ConnHandle::new(4),
+            Address::new(AddrKind::PUBLIC, BdAddr::new(ADDR_2)),
+            LeConnRole::Peripheral,
+            ConnParams::new(),
+        ));
+        let connections = mgr.connections.borrow();
+        let storage = unwrap!(connections.iter().find(|c| c.handle == ConnHandle::new(4)));
+        assert_eq!(storage.resolvable_addrs.peer, None);
     }
 
     #[test]
